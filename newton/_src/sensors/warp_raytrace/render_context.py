@@ -412,6 +412,10 @@ class RenderContext:
                 render_kernel = create_kernel(self.config, self.state, clear_data)
                 self.kernel_cache[kernel_cache_key] = render_kernel
 
+            launch_kwargs = {}
+            if self.config.block_dim > 0:
+                launch_kwargs["block_dim"] = self.config.block_dim
+
             wp.launch(
                 kernel=render_kernel,
                 dim=(self.world_count * camera_count * width * height),
@@ -467,6 +471,7 @@ class RenderContext:
                     albedo_image,
                 ],
                 device=self.device,
+                **launch_kwargs,
             )
 
     @property
