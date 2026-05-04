@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,33 @@ from .gaussians import compute_gaussian_bounds
 from .render import create_kernel
 from .types import ClearData, MeshData, RenderConfig, RenderOrder, TextureData
 from .utils import Utils
+
+
+_RENDER_SHAPE_TYPES = (
+    GeoType.BOX,
+    GeoType.CAPSULE,
+    GeoType.CYLINDER,
+    GeoType.ELLIPSOID,
+    GeoType.PLANE,
+    GeoType.SPHERE,
+    GeoType.CONE,
+    GeoType.MESH,
+    GeoType.GAUSSIAN,
+)
+_ALL_RENDER_SHAPE_TYPE_MASK = 0
+for _shape_type in _RENDER_SHAPE_TYPES:
+    _ALL_RENDER_SHAPE_TYPE_MASK |= 1 << int(_shape_type)
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in ("0", "false", "off", "no")
+
+
+def _shape_type_bit(shape_type: GeoType | int) -> int:
+    return 1 << int(shape_type)
 
 
 @wp.kernel(enable_backward=False)
@@ -126,6 +154,12 @@ class RenderContext:
         """Mutable flags tracking which render outputs are active."""
 
         num_gaussians: int = 0
+        shape_type_mask: int = 0
+        enable_global_world: bool = False
+        has_particles: bool = False
+        has_triangle_mesh: bool = False
+        has_lights: bool = False
+        has_gaussians: bool = False
         render_color: bool = False
         render_depth: bool = False
         render_shape_index: bool = False
@@ -169,6 +203,9 @@ class RenderContext:
         self.__particles_position: wp.array[wp.vec3f] | None = None
         self.__particles_radius: wp.array[wp.float32] | None = None
         self.__particles_world_index: wp.array[wp.int32] | None = None
+        self.__has_global_world_primitives: bool = False
+        self.__shape_type_mask: int = 0
+        self.__render_state_dumped: bool = False
 
         self.__gaussians_data: wp.array[Gaussian.Data] | None = None
 
@@ -183,6 +220,7 @@ class RenderContext:
         self.shape_texture_ids: wp.array[wp.int32] | None = None
         self.shape_mesh_data_ids: wp.array[wp.int32] | None = None
 
+        self.__render_meshes: list[wp.Mesh] = []
         self.mesh_data: wp.array[MeshData] | None = None
         self.texture_data: wp.array[TextureData] | None = None
 
@@ -215,8 +253,13 @@ class RenderContext:
         self.__particles_position = None
         self.__particles_radius = None
         self.__particles_world_index = None
+        self.__render_meshes = []
+        self.__has_global_world_primitives = self.__model_has_global_world_primitives(model)
+        self.__shape_type_mask = self.__compute_shape_type_mask(model)
+        self.state.enable_global_world = self.enable_global_world_effective
+        self.state.shape_type_mask = self.__shape_type_mask
 
-        self.shape_source_ptr = model.shape_source_ptr
+        self.shape_source_ptr = self.__create_render_shape_source_ptr(model)
         self.shape_bounds = wp.empty((model.shape_count, 2), dtype=wp.vec3f, ndim=2, device=self.device)
 
         if model.particle_q is not None and model.particle_q.shape[0]:
@@ -303,7 +346,12 @@ class RenderContext:
 
         if self.has_triangle_mesh:
             if self.triangle_mesh is None:
-                self.triangle_mesh = wp.Mesh(self.triangle_points, self.triangle_indices, device=self.device)
+                self.triangle_mesh = wp.Mesh(
+                    self.triangle_points,
+                    self.triangle_indices,
+                    device=self.device,
+                    bvh_constructor=self.config.mesh_bvh_constructor,
+                )
             else:
                 self.triangle_mesh.refit()
 
@@ -341,6 +389,25 @@ class RenderContext:
                 rendering. Pass ``None`` to use :attr:`DEFAULT_CLEAR_DATA`.
         """
         if self.has_shapes or self.has_particles or self.has_triangle_mesh or self.has_gaussians:
+            use_static_shape_types = _env_flag("NEWTON_RENDER_STATIC_SHAPE_TYPES")
+            use_static_particles = _env_flag("NEWTON_RENDER_STATIC_PARTICLES")
+            use_static_triangle_mesh = _env_flag("NEWTON_RENDER_STATIC_TRIANGLE_MESH")
+            use_static_lights = _env_flag("NEWTON_RENDER_STATIC_LIGHTS")
+            use_static_gaussians = _env_flag("NEWTON_RENDER_STATIC_GAUSSIANS")
+
+            self.state.shape_type_mask = self.__shape_type_mask if use_static_shape_types else _ALL_RENDER_SHAPE_TYPE_MASK
+            self.state.enable_global_world = self.enable_global_world_effective
+            self.state.has_particles = self.config.enable_particles and (
+                self.particle_count_total > 0 if use_static_particles else True
+            )
+            self.state.has_triangle_mesh = self.has_triangle_mesh if use_static_triangle_mesh else True
+            self.state.has_gaussians = bool(
+                (self.state.num_gaussians > 0 if use_static_gaussians else True)
+                and (self.state.shape_type_mask & _shape_type_bit(GeoType.GAUSSIAN))
+            )
+            self.state.has_lights = self.light_count > 0 if use_static_lights else True
+            self.__maybe_dump_render_state()
+
             if refit_bvh:
                 self.refit_bvh()
 
@@ -476,9 +543,47 @@ class RenderContext:
 
     @property
     def world_count_total(self) -> int:
-        if self.config.enable_global_world:
+        if self.enable_global_world_effective:
             return self.world_count + 1
         return self.world_count
+
+    @property
+    def enable_global_world_effective(self) -> bool:
+        if not _env_flag("NEWTON_RENDER_STATIC_GLOBAL_WORLD"):
+            return self.config.enable_global_world
+        return self.config.enable_global_world and self.__has_global_world_primitives
+
+    def __maybe_dump_render_state(self):
+        if self.__render_state_dumped or not _env_flag("NEWTON_RENDER_DUMP_STATE", default=False):
+            return
+
+        shape_names = [
+            shape_type.name
+            for shape_type in _RENDER_SHAPE_TYPES
+            if self.state.shape_type_mask & _shape_type_bit(shape_type)
+        ]
+        print(
+            "[NEWTON_RENDER_STATE] "
+            f"static_global_world={_env_flag('NEWTON_RENDER_STATIC_GLOBAL_WORLD')} "
+            f"static_shape_types={_env_flag('NEWTON_RENDER_STATIC_SHAPE_TYPES')} "
+            f"static_particles={_env_flag('NEWTON_RENDER_STATIC_PARTICLES')} "
+            f"static_triangle_mesh={_env_flag('NEWTON_RENDER_STATIC_TRIANGLE_MESH')} "
+            f"static_lights={_env_flag('NEWTON_RENDER_STATIC_LIGHTS')} "
+            f"static_gaussians={_env_flag('NEWTON_RENDER_STATIC_GAUSSIANS')} "
+            f"config_enable_global_world={self.config.enable_global_world} "
+            f"has_global_world_primitives={self.__has_global_world_primitives} "
+            f"state_enable_global_world={self.state.enable_global_world} "
+            f"shape_type_mask={self.state.shape_type_mask} "
+            f"shape_types={shape_names} "
+            f"has_particles={self.state.has_particles} "
+            f"particle_count={self.particle_count_total} "
+            f"has_triangle_mesh={self.state.has_triangle_mesh} "
+            f"has_lights={self.state.has_lights} "
+            f"light_count={self.light_count} "
+            f"has_gaussians={self.state.has_gaussians} "
+            f"num_gaussians={self.state.num_gaussians}"
+        )
+        self.__render_state_dumped = True
 
     @property
     def particle_count_total(self) -> int:
@@ -620,6 +725,87 @@ class RenderContext:
                 bvh.refit()
 
         return bvh, group_roots
+
+    def __create_render_shape_source_ptr(self, model: Model) -> wp.array[wp.uint64]:
+        """Return source pointers used by rendering.
+
+        The default renderer path reuses ``model.shape_source_ptr`` exactly as
+        before. When a mesh BVH constructor is configured, build separate
+        render-owned ``wp.Mesh`` handles for mesh sources and replace only
+        those source IDs in a renderer-local array. This keeps physics and
+        collision mesh handles on their original BVH backend.
+        """
+        constructor = self.config.mesh_bvh_constructor
+        if constructor is None:
+            return model.shape_source_ptr
+
+        self.__validate_mesh_bvh_constructor(constructor)
+
+        render_source_ids = model.shape_source_ptr.numpy().astype(np.uint64, copy=True)
+        render_meshes_by_hash: dict[int, wp.Mesh] = {}
+
+        with wp.ScopedDevice(self.device):
+            for shape_index, shape in enumerate(model.shape_source):
+                if not isinstance(shape, Mesh):
+                    continue
+
+                mesh_hash = hash(shape)
+                render_mesh = render_meshes_by_hash.get(mesh_hash)
+                if render_mesh is None:
+                    points = wp.array(shape.vertices, dtype=wp.vec3, device=self.device)
+                    indices = wp.array(shape.indices, dtype=wp.int32, device=self.device)
+                    render_mesh = wp.Mesh(points=points, indices=indices, bvh_constructor=constructor)
+                    render_meshes_by_hash[mesh_hash] = render_mesh
+
+                render_source_ids[shape_index] = render_mesh.id
+
+        self.__render_meshes = list(render_meshes_by_hash.values())
+        return wp.array(render_source_ids, dtype=wp.uint64, device=self.device)
+
+    @staticmethod
+    def __validate_mesh_bvh_constructor(constructor: str):
+        if constructor != "cubql":
+            return
+
+        is_cubql_available = getattr(wp, "is_cubql_available", None)
+        if is_cubql_available is None or not is_cubql_available():
+            raise RuntimeError(
+                "RenderConfig(mesh_bvh_constructor='cubql') requires a Warp build with cuBQL support. "
+                "Install a cuBQL-enabled Warp nightly or source build, or leave mesh_bvh_constructor=None."
+            )
+
+    @staticmethod
+    def __model_has_global_world_primitives(model: Model) -> bool:
+        if model.shape_world is not None and model.shape_world.shape[0] > 0:
+            if np.any(model.shape_world.numpy() < 0):
+                return True
+
+        if model.particle_world is not None and model.particle_world.shape[0] > 0:
+            if np.any(model.particle_world.numpy() < 0):
+                return True
+
+        return False
+
+    @staticmethod
+    def __compute_shape_type_mask(model: Model) -> int:
+        if model.shape_count == 0:
+            return 0
+
+        supported_shape_types = {int(shape_type) for shape_type in _RENDER_SHAPE_TYPES}
+        visible_flag = int(ShapeFlags.VISIBLE)
+        shape_types = model.shape_type.numpy()
+        shape_flags = model.shape_flags.numpy()
+
+        shape_type_mask = 0
+        for shape_type, shape_flag in zip(shape_types, shape_flags):
+            shape_type = int(shape_type)
+            if not (int(shape_flag) & visible_flag):
+                continue
+            if shape_type not in supported_shape_types:
+                continue
+            shape_type_mask |= 1 << shape_type
+
+        return shape_type_mask
 
     def __compute_bvh_bounds_shapes(
         self, lowers: wp.array[wp.vec3f], uppers: wp.array[wp.vec3f], groups: wp.array[wp.int32]

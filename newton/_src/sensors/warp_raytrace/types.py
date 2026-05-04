@@ -90,6 +90,15 @@ class RenderConfig:
     ``@wp.kernel(launch_bounds=...)``. ``None`` keeps the kernel
     unconstrained (Warp default)."""
 
+    mesh_bvh_constructor: str | None = None
+    """Optional BVH constructor for render-owned mesh handles.
+
+    ``None`` reuses the simulation mesh handles. Values such as ``"lbvh"``,
+    ``"sah"``, ``"median"``, or ``"cubql"`` build separate render-only
+    :class:`wp.Mesh` objects with the requested constructor while leaving
+    physics/collision mesh handles unchanged.
+    """
+
 
 @dataclass(unsafe_hash=True)
 class ClearData:

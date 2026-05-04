@@ -110,7 +110,9 @@ def create_kernel(
         camera_transform = camera_transforms[camera_index, world_index]
         ray_origin_world = wp.transform_point(camera_transform, camera_rays[camera_index, py, px, 0])
         ray_dir_world = wp.transform_vector(camera_transform, camera_rays[camera_index, py, px, 1])
-        camera_forward = wp.transform_vector(camera_transform, wp.vec3f(0.0, 0.0, -1.0))
+        camera_forward = wp.vec3f(0.0)
+        if wp.static(state.has_gaussians):
+            camera_forward = wp.transform_vector(camera_transform, wp.vec3f(0.0, 0.0, -1.0))
 
         closest_hit = raytrace_closest_hit(
             bvh_shapes_size,
@@ -221,33 +223,34 @@ def create_kernel(
 
                 shaded_color = wp.cw_mul(albedo_color, ambient_color * ambient_intensity)
 
-            # Apply lighting and shadows
-            for light_index in range(light_count):
-                light_contribution = compute_lighting(
-                    world_index,
-                    bvh_shapes_size,
-                    bvh_shapes_id,
-                    bvh_shapes_group_roots,
-                    bvh_particles_size,
-                    bvh_particles_id,
-                    bvh_particles_group_roots,
-                    shape_enabled,
-                    shape_types,
-                    shape_sizes,
-                    shape_transforms,
-                    shape_source_ptr,
-                    light_active[light_index],
-                    light_type[light_index],
-                    light_cast_shadow[light_index],
-                    light_positions[light_index],
-                    light_orientations[light_index],
-                    particles_position,
-                    particles_radius,
-                    triangle_mesh_id,
-                    closest_hit.normal,
-                    hit_point,
-                )
-                shaded_color = shaded_color + albedo_color * light_contribution
+            if wp.static(state.has_lights):
+                # Apply lighting and shadows
+                for light_index in range(light_count):
+                    light_contribution = compute_lighting(
+                        world_index,
+                        bvh_shapes_size,
+                        bvh_shapes_id,
+                        bvh_shapes_group_roots,
+                        bvh_particles_size,
+                        bvh_particles_id,
+                        bvh_particles_group_roots,
+                        shape_enabled,
+                        shape_types,
+                        shape_sizes,
+                        shape_transforms,
+                        shape_source_ptr,
+                        light_active[light_index],
+                        light_type[light_index],
+                        light_cast_shadow[light_index],
+                        light_positions[light_index],
+                        light_orientations[light_index],
+                        particles_position,
+                        particles_radius,
+                        triangle_mesh_id,
+                        closest_hit.normal,
+                        hit_point,
+                    )
+                    shaded_color = shaded_color + albedo_color * light_contribution
 
         out_color[out_index] = tiling.pack_rgba_to_uint32(shaded_color, 1.0)
 
